@@ -5,7 +5,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from hff_remover.detector import HFFDetector, HFF_CLASSES, CLASS_NAMES
+from hff_remover.detector import (
+    HFFDetector,
+    HFF_CLASSES,
+    CLASS_NAMES,
+    SuryaLayoutDetector,
+    SURYA_HFF_CLASS_IDS,
+    _surya_label_to_our_class,
+)
 
 
 class TestHFFClasses:
@@ -203,3 +210,179 @@ class TestHFFDetector:
         # Check that predict was called with the confidence threshold
         call_kwargs = mock_model.predict.call_args[1]
         assert call_kwargs["conf"] == 0.7
+
+
+# =============================================================================
+# Surya Layout Detector tests (our labels only; no YOLO/save_results in class)
+# =============================================================================
+
+class TestSuryaHFFClassMapping:
+    """Tests for Surya HFF class constants and mapping (no surya import needed)."""
+
+    def test_surya_hff_class_ids(self):
+        """Our class_id mapping: 0=text, 1=footer, 2=header, 3=footnote."""
+        assert SURYA_HFF_CLASS_IDS[0] == "text"
+        assert SURYA_HFF_CLASS_IDS[1] == "footer"
+        assert SURYA_HFF_CLASS_IDS[2] == "header"
+        assert SURYA_HFF_CLASS_IDS[3] == "footnote"
+        assert len(SURYA_HFF_CLASS_IDS) == 4
+
+    def test_surya_label_to_our_class_mapping(self):
+        """Normalized Surya labels map to our (class_id, class_name)."""
+        assert _surya_label_to_our_class("Text") == (0, "text")
+        assert _surya_label_to_our_class("Page-footer") == (1, "footer")
+        assert _surya_label_to_our_class("Page-header") == (2, "header")
+        assert _surya_label_to_our_class("Footnote") == (3, "footnote")
+        assert _surya_label_to_our_class("Section-header") == (2, "header")
+
+    def test_surya_label_unknown_returns_none_when_not_default(self):
+        """Unknown Surya labels return None when default_to_text=False."""
+        assert _surya_label_to_our_class("Table") is None
+        assert _surya_label_to_our_class("Picture") is None
+
+    def test_surya_label_unknown_maps_to_text_when_default(self):
+        """Unknown Surya labels map to (0, 'text') when default_to_text=True."""
+        assert _surya_label_to_our_class("Table", default_to_text=True) == (0, "text")
+
+
+class TestSuryaLayoutDetector:
+    """Tests for SuryaLayoutDetector: our class_id/class_name only, no raw Surya labels."""
+
+    @pytest.fixture(autouse=True)
+    def skip_if_no_surya(self):
+        pytest.importorskip("surya")
+
+    @patch("surya.layout.LayoutPredictor")
+    @patch("surya.foundation.FoundationPredictor")
+    def test_detect_returns_only_our_classes(self, mock_foundation, mock_layout_cls):
+        """detect() returns only our HFF/text classes with our class_id and class_name."""
+        mock_layout = MagicMock()
+        mock_layout.return_value = [
+            {
+                "bboxes": [
+                    {"bbox": [10, 10, 100, 30], "label": "Page-header", "top_k": {"Page-header": 0.9}},
+                    {"bbox": [10, 500, 100, 530], "label": "Page-footer", "top_k": {"Page-footer": 0.85}},
+                    {"bbox": [10, 100, 400, 400], "label": "Text", "top_k": {"Text": 0.95}},
+                ]
+            }
+        ]
+        mock_layout_cls.return_value = mock_layout
+        mock_foundation.return_value = MagicMock()
+
+        detector = SuryaLayoutDetector(confidence_threshold=0.3)
+        detections = detector.detect(np.zeros((600, 500, 3), dtype=np.uint8))
+
+        assert len(detections) == 3
+        class_ids = {d["class_id"] for d in detections}
+        class_names = {d["class_name"] for d in detections}
+        assert class_ids <= {0, 1, 2, 3}
+        assert class_names <= {"text", "footer", "header", "footnote"}
+        for d in detections:
+            assert "bbox" in d and len(d["bbox"]) == 4
+            assert "confidence" in d
+            assert isinstance(d["class_id"], int)
+            assert d["class_name"] in ("text", "footer", "header", "footnote")
+
+    @patch("surya.layout.LayoutPredictor")
+    @patch("surya.foundation.FoundationPredictor")
+    def test_detect_filters_by_confidence(self, mock_foundation, mock_layout_cls):
+        """detect() filters out detections below confidence threshold."""
+        mock_layout = MagicMock()
+        mock_layout.return_value = [
+            {
+                "bboxes": [
+                    {"bbox": [10, 10, 100, 30], "label": "Page-header", "top_k": {"Page-header": 0.9}},
+                    {"bbox": [10, 500, 100, 530], "label": "Footnote", "top_k": {"Footnote": 0.2}},
+                ]
+            }
+        ]
+        mock_layout_cls.return_value = mock_layout
+        mock_foundation.return_value = MagicMock()
+
+        detector = SuryaLayoutDetector(confidence_threshold=0.5)
+        detections = detector.detect(np.zeros((600, 500, 3), dtype=np.uint8))
+
+        assert len(detections) == 1
+        assert detections[0]["class_name"] == "header"
+
+    @patch("surya.layout.LayoutPredictor")
+    @patch("surya.foundation.FoundationPredictor")
+    def test_detect_no_raw_surya_labels(self, mock_foundation, mock_layout_cls):
+        """Output never contains raw Surya label names (e.g. Page-header, Text)."""
+        mock_layout = MagicMock()
+        mock_layout.return_value = [
+            {
+                "bboxes": [
+                    {"bbox": [10, 10, 100, 30], "label": "Page-header", "top_k": {"Page-header": 0.9}},
+                ]
+            }
+        ]
+        mock_layout_cls.return_value = mock_layout
+        mock_foundation.return_value = MagicMock()
+
+        detector = SuryaLayoutDetector(confidence_threshold=0.3)
+        detections = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+
+        raw_names = {"Page-header", "Page-footer", "Footnote", "Text", "Section-header", "Caption"}
+        for d in detections:
+            assert d["class_name"] not in raw_names
+            assert d["class_name"] in ("text", "footer", "header", "footnote")
+
+    @patch("surya.layout.LayoutPredictor")
+    @patch("surya.foundation.FoundationPredictor")
+    def test_detect_batch_same_format(self, mock_foundation, mock_layout_cls):
+        """detect_batch() returns list of lists with same dict format (our class_id/class_name)."""
+        mock_layout = MagicMock()
+        mock_layout.return_value = [
+            {"bboxes": [{"bbox": [0, 0, 50, 20], "label": "Text", "top_k": {"Text": 0.8}}]},
+            {"bboxes": [{"bbox": [0, 0, 50, 20], "label": "Footnote", "top_k": {"Footnote": 0.7}}]},
+        ]
+        mock_layout_cls.return_value = mock_layout
+        mock_foundation.return_value = MagicMock()
+
+        detector = SuryaLayoutDetector(confidence_threshold=0.3)
+        results = detector.detect_batch(
+            [np.zeros((100, 100, 3), dtype=np.uint8), np.zeros((100, 100, 3), dtype=np.uint8)]
+        )
+
+        assert len(results) == 2
+        assert len(results[0]) == 1 and results[0][0]["class_id"] == 0 and results[0][0]["class_name"] == "text"
+        assert len(results[1]) == 1 and results[1][0]["class_id"] == 3 and results[1][0]["class_name"] == "footnote"
+
+    @patch("surya.layout.LayoutPredictor")
+    @patch("surya.foundation.FoundationPredictor")
+    def test_get_all_detections_same_format(self, mock_foundation, mock_layout_cls):
+        """get_all_detections() returns our class_id and class_name only."""
+        mock_layout = MagicMock()
+        mock_layout.return_value = [
+            {
+                "bboxes": [
+                    {"bbox": [0, 0, 50, 20], "label": "Text", "top_k": {"Text": 0.8}},
+                    {"bbox": [0, 80, 50, 100], "label": "Table", "top_k": {"Table": 0.9}},
+                ]
+            }
+        ]
+        mock_layout_cls.return_value = mock_layout
+        mock_foundation.return_value = MagicMock()
+
+        detector = SuryaLayoutDetector(confidence_threshold=0.3)
+        detections = detector.get_all_detections(np.zeros((100, 100, 3), dtype=np.uint8))
+
+        # Table maps to (0, "text") when filter_to_hff_only=False (default_to_text=True)
+        assert len(detections) == 2
+        for d in detections:
+            assert d["class_id"] in (0, 1, 2, 3)
+            assert d["class_name"] in ("text", "footer", "header", "footnote")
+
+    @patch("surya.layout.LayoutPredictor")
+    @patch("surya.foundation.FoundationPredictor")
+    def test_detect_empty_bboxes(self, mock_foundation, mock_layout_cls):
+        """detect() returns empty list when layout returns no bboxes."""
+        mock_layout = MagicMock()
+        mock_layout.return_value = [{"bboxes": []}]
+        mock_layout_cls.return_value = mock_layout
+        mock_foundation.return_value = MagicMock()
+
+        detector = SuryaLayoutDetector()
+        detections = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+        assert detections == []

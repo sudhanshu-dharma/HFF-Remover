@@ -606,6 +606,231 @@ class PPDocLayoutDetector(BaseHFFDetector):
         return detections
 
 
+# Surya layout detector (our labels: 0=text, 1=footer, 2=header, 3=footnote)
+SURYA_HFF_CLASS_IDS = {
+    0: "text",
+    1: "footer",
+    2: "header",
+    3: "footnote",
+}
+SURYA_LABEL_TO_OUR_CLASS = {
+    "text": (0, "text"),
+    "caption": (0, "text"),
+    "list-item": (0, "text"),
+    "formula": (0, "text"),
+    "text-inline-math": (0, "text"),
+    "handwriting": (0, "text"),
+    "table-of-contents": (0, "text"),
+    "form": (0, "text"),
+    "table": (0, "text"),
+    "picture": (0, "text"),
+    "figure": (0, "text"),
+    "section-header": (2, "header"),
+    "page-header": (2, "header"),
+    "page-footer": (1, "footer"),
+    "footnote": (3, "footnote"),
+}
+
+
+def _surya_label_to_our_class(surya_label: str, default_to_text: bool = False) -> Optional[tuple]:
+    key = surya_label.strip().lower().replace(" ", "-") if surya_label else ""
+    out = SURYA_LABEL_TO_OUR_CLASS.get(key)
+    if out is not None:
+        return out
+    return (0, "text") if default_to_text else None
+
+
+class SuryaLayoutDetector(BaseHFFDetector):
+    def __init__(
+        self,
+        confidence_threshold: float = 0.5,
+        layout_checkpoint: Optional[str] = None,
+    ):
+        from surya.layout import LayoutPredictor
+        from surya.foundation import FoundationPredictor
+        from surya.settings import settings
+
+        self.confidence_threshold = confidence_threshold
+        checkpoint = layout_checkpoint or getattr(settings, "LAYOUT_MODEL_CHECKPOINT", None)
+        foundation = FoundationPredictor() if checkpoint is None else FoundationPredictor(checkpoint=checkpoint)
+        self.layout_predictor = LayoutPredictor(foundation)
+
+    def _load_image(self, image: Union[str, Path, np.ndarray]) -> Any:
+        from PIL import Image
+
+        if isinstance(image, (str, Path)):
+            return Image.open(str(image)).convert("RGB")
+        if isinstance(image, np.ndarray):
+            if image.ndim == 2:
+                return Image.fromarray(image).convert("RGB")
+            if image.shape[2] == 3:
+                return Image.fromarray(image[:, :, ::-1])
+            return Image.fromarray(image).convert("RGB")
+        return image
+
+    def _layout_result_to_detections(
+        self,
+        layout_pred: Any,
+        apply_confidence_filter: bool = True,
+        filter_to_hff_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        detections: List[Dict[str, Any]] = []
+        if hasattr(layout_pred, "bboxes"):
+            bboxes_data = layout_pred.bboxes or []
+        elif isinstance(layout_pred, dict):
+            bboxes_data = layout_pred.get("bboxes") or layout_pred.get("boxes") or []
+        else:
+            bboxes_data = []
+
+        for item in bboxes_data:
+            raw_label = (item.get("label") or item.get("type") or "") if isinstance(item, dict) else getattr(item, "label", "")
+            bbox = item.get("bbox") if isinstance(item, dict) else getattr(item, "bbox", None)
+            top_k = item.get("top_k") if isinstance(item, dict) else getattr(item, "top_k", None) or {}
+            conf = 1.0
+            if isinstance(item, dict) and "confidence" in item:
+                conf = float(item["confidence"])
+            elif hasattr(item, "confidence") and item.confidence is not None:
+                conf = float(item.confidence)
+            elif isinstance(top_k, dict) and top_k:
+                key = str(raw_label).strip().lower().replace(" ", "-") if raw_label else ""
+                conf = float(top_k.get(raw_label) or top_k.get(key) or list(top_k.values())[0])
+
+            if apply_confidence_filter and conf < self.confidence_threshold:
+                continue
+
+            raw_label = str(raw_label or "")
+            mapped = _surya_label_to_our_class(raw_label, default_to_text=not filter_to_hff_only)
+            if mapped is None:
+                continue
+            our_class_id, our_class_name = mapped
+
+            if not bbox or len(bbox) < 4:
+                continue
+            bbox = list(bbox)
+            if len(bbox) == 4:
+                bbox = list(map(float, bbox))
+            elif len(bbox) == 8:
+                xs, ys = bbox[0::2], bbox[1::2]
+                bbox = [min(xs), min(ys), max(xs), max(ys)]
+            else:
+                continue
+
+            detections.append({
+                "bbox": bbox,
+                "class_id": our_class_id,
+                "class_name": our_class_name,
+                "confidence": conf,
+            })
+
+        return detections
+
+    def detect(
+        self,
+        image: Union[str, Path, np.ndarray],
+        image_size: int = 1024,
+    ) -> List[Dict[str, Any]]:
+        pil_image = self._load_image(image)
+        layout_predictions = self.layout_predictor([pil_image])
+        if not layout_predictions:
+            return []
+        return self._layout_result_to_detections(
+            layout_predictions[0],
+            apply_confidence_filter=True,
+            filter_to_hff_only=True,
+        )
+
+    def detect_batch(
+        self,
+        images: List[Union[str, Path, np.ndarray]],
+        image_size: int = 1024,
+        batch_size: int = 8,
+    ) -> List[List[Dict[str, Any]]]:
+        pil_list = [self._load_image(im) for im in images]
+        layout_predictions = self.layout_predictor(pil_list)
+
+        all_detections: List[List[Dict[str, Any]]] = []
+        for pred in layout_predictions:
+            all_detections.append(
+                self._layout_result_to_detections(
+                    pred,
+                    apply_confidence_filter=True,
+                    filter_to_hff_only=True,
+                )
+            )
+        return all_detections
+
+    def get_all_detections(
+        self,
+        image: Union[str, Path, np.ndarray],
+        image_size: int = 1024,
+    ) -> List[Dict[str, Any]]:
+        _ = image_size
+        pil_image = self._load_image(image)
+        layout_predictions = self.layout_predictor([pil_image])
+        if not layout_predictions:
+            return []
+        return self._layout_result_to_detections(
+            layout_predictions[0],
+            apply_confidence_filter=True,
+            filter_to_hff_only=False,
+        )
+
+    def save_to_yolo(
+        self,
+        image: Union[str, Path, np.ndarray],
+        image_rel_path: Union[str, Path],
+        inference_dir: Union[str, Path] = "inference_data",
+        detections: Optional[List[Dict[str, Any]]] = None,
+        merge_same_class: bool = True,
+    ) -> tuple:
+        """
+        Save detections in YOLO format using processor.YOLOInferenceDatasetWriter.
+        Same output as processor: inference_dir/images/, labels/*.txt, data.yaml.
+        Returns (image_out_path, label_out_path).
+        """
+        from hff_remover.processor import YOLOInferenceDatasetWriter
+        from hff_remover.utils import load_image
+
+        if detections is None:
+            detections = self.detect(image)
+        if isinstance(image, (str, Path)):
+            image = load_image(image)
+        if merge_same_class:
+            by_class: Dict[int, List[Dict[str, Any]]] = {}
+            for d in detections:
+                cid = d.get("class_id")
+                if cid is None:
+                    continue
+                by_class.setdefault(cid, []).append(d)
+            merged = []
+            for cid, group in by_class.items():
+                boxes = [b.get("bbox") for b in group if b.get("bbox") and len(b.get("bbox", [])) == 4]
+                if not boxes:
+                    continue
+                x1 = min(b[0] for b in boxes)
+                y1 = min(b[1] for b in boxes)
+                x2 = max(b[2] for b in boxes)
+                y2 = max(b[3] for b in boxes)
+                best = max(group, key=lambda b: b.get("confidence", 0))
+                merged.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "class_id": cid,
+                    "class_name": best.get("class_name", ""),
+                    "confidence": best.get("confidence", 0),
+                })
+            detections = merged
+        class_name_to_id = {name: idx for idx, name in SURYA_HFF_CLASS_IDS.items()}
+        writer = YOLOInferenceDatasetWriter(
+            base_dir=inference_dir,
+            class_name_to_id=class_name_to_id,
+        )
+        return writer.write_sample(
+            image=image,
+            detections=detections,
+            image_rel_path=image_rel_path,
+        )
+
+
 # =============================================================================
 # Ensemble Detector
 # =============================================================================

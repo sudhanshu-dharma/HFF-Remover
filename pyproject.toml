@@ -26,6 +26,8 @@ dependencies = [
     "huggingface-hub>=0.20.0",
     "paddleocr==2.9.0",
     "paddlepaddle==3.0.0",
+    "surya-ocr>=0.17.0",
+    "transformers>=4.30.2,<5",
 ]
 
 [project.optional-dependencies]
