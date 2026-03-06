@@ -177,6 +177,17 @@ pytest
 # Run with coverage
 pytest --cov=hff_remover
 ```
+# Surya HFF detector
+
+- **What:** A detector that uses the Surya layout model to find headers, footers, footnotes, and text in document images. Output uses our 4 classes only: **0=text, 1=footer, 2=header, 3=footnote** (no raw Surya labels).
+
+- **Where:** `SuryaLayoutDetector` in `src/hff_remover/detector.py`. Same interface as other detectors: `detect()`, `detect_batch()`, `get_all_detections()`.
+
+- **Saving:** YOLO output is written via the existing **processor** class (`YOLOInferenceDatasetWriter`). The Surya class has `save_to_yolo()` which calls that writer (optional same-class merge before saving).
+
+- **Run:** `python test.py <image_path> [inference_dir]` — detects and saves to `inference_data/` (images, labels/*.txt, data.yaml). Use `--merge` to merge same-class boxes into one per class.
+
+- **Dependencies:** `surya-ocr`, `transformers>=4.30.2,<5` (in pyproject.toml).
 
 ## License
 
